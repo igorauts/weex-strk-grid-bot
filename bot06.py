@@ -10,6 +10,7 @@ import fcntl
 import base64
 import hashlib
 import asyncio
+import signal
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -22,7 +23,7 @@ from dotenv import load_dotenv
 
 
 # =========================================================
-# WEEX STRK GRID BOT v0.6.7
+# WEEX STRK GRID BOT v0.6.8.2
 #
 # Основа торговли сохранена из предыдущих версий.
 # Актуальная логика v0.6.2:
@@ -62,11 +63,14 @@ from dotenv import load_dotenv
 # - статистика больше не держит maintenance_lock и не задерживает reconnect/reconcile
 # - все signed private REST проходят через общий внутрипроцессный limiter
 # - crash возвращает exit code 1; опциональные Telegram alerts для критических событий
+# - v0.6.8: статистика хранит постоянный clientOrderId -> BUY orderId map и больше не теряет TP после rearm
+# - v0.6.8: SIGUSR1 печатает свежую полную статистику без рестарта; helper-команда stats06
+# - v0.6.8.2: history/userTrades запросы статистики режутся на окна <7 дней (лимит WEEX -1170)
 # - bot НЕ проверяет и НЕ меняет плечо: leverage полностью контролируется пользователем на WEEX
 # =========================================================
 
 
-VERSION = "0.6.7"
+VERSION = "0.6.8.1"
 
 BASE = "https://api-contract.weex.com"
 PRIVATE_WS = "wss://ws-contract.weex.com/v3/ws/private"
@@ -1252,7 +1256,11 @@ async def trade_request(
 # - ошибка статистики НЕ ставит торговлю на паузу.
 # =========================================================
 
-STATS_SCHEMA = 1
+STATS_SCHEMA = 2
+
+# WEEX rejects private history requests whose requested time range exceeds 7 days
+# (HTTP 400 / code -1170). Keep a safety margin below the documented limit.
+STATS_API_MAX_RANGE_MS = (7 * 24 * 60 * 60 * 1000) - 60_000
 
 
 class StatsError(RuntimeError):
@@ -1302,7 +1310,8 @@ def new_stats_cache():
         "total_fees": "0",
         "seen_trade_ids": [],
         "processed_completed": [],
-        "open_buys": {}
+        "open_buys": {},
+        "client_order_map": {}
     }
 
 
@@ -1315,7 +1324,20 @@ def load_stats_cache():
         STATS_STATE_FILE.read_text()
     )
 
-    if data.get("schema") != STATS_SCHEMA:
+    schema = data.get("schema")
+
+    # v0.6.8 can migrate the live v0.6.7 statistics cache in place.
+    # Keep the already verified cumulative totals/processed parent IDs, add the
+    # persistent parent map, then let update_stats_sync backfill TP cycles that
+    # v0.6.7 silently skipped.
+    if schema == 1 and STATS_SCHEMA == 2:
+        data["schema"] = 2
+        data.setdefault(
+            "client_order_map",
+            {}
+        )
+
+    elif schema != STATS_SCHEMA:
         raise StatsError(
             "Неподдерживаемая версия stats_state06.json"
         )
@@ -1340,7 +1362,8 @@ def load_stats_cache():
         "total_fees",
         "seen_trade_ids",
         "processed_completed",
-        "open_buys"
+        "open_buys",
+        "client_order_map"
     )
 
     for key in required:
@@ -1581,12 +1604,55 @@ def stats_fetch_trades(
     depth=0
 ):
 
+    start = int(start)
+    end = int(end)
+
     if end <= start:
         return []
 
-    if depth > 40:
+    if depth > 80:
         raise StatsError(
             "Слишком глубокое деление userTrades"
+        )
+
+    # WEEX /userTrades also rejects a single requested interval > 7 days.
+    # Split by time BEFORE making the HTTP request. A second split below still
+    # handles a valid window that contains the API limit of 100 fills.
+    if end - start > STATS_API_MAX_RANGE_MS:
+
+        split_end = min(
+            end,
+            start + STATS_API_MAX_RANGE_MS
+        )
+
+        left = stats_fetch_trades(
+            start,
+            split_end,
+            depth + 1
+        )
+
+        right = stats_fetch_trades(
+            split_end + 1,
+            end,
+            depth + 1
+        )
+
+        merged = {}
+
+        for trade in left + right:
+
+            trade_id = str(
+                trade.get(
+                    "id",
+                    ""
+                )
+            )
+
+            if trade_id:
+                merged[trade_id] = trade
+
+        return list(
+            merged.values()
         )
 
     data = private_request(
@@ -1594,8 +1660,8 @@ def stats_fetch_trades(
         "/capi/v3/userTrades",
         {
             "symbol": SYMBOL,
-            "startTime": int(start),
-            "endTime": int(end),
+            "startTime": start,
+            "endTime": end,
             "limit": 100
         },
         None
@@ -1771,69 +1837,331 @@ def merge_buy_trade(
     ][parent_id] = current
 
 
-def algo_parent_id(algo):
+def stats_parent_client_id(algo):
 
-    # Prefer our deterministic TP client ID -> parent BUY client ID mapping.
-    # This works for both attached "...tp" and recovery "...rtp" TP orders,
-    # including completed TP history where actualOrderId may be the triggered
-    # SELL order rather than the opening BUY.
-    algo_cid = str(
+    cid = str(
         algo.get(
             "clientAlgoId",
             ""
         )
     )
 
-    parent_cid = None
+    if not cid.startswith(PREFIX):
+        return None
 
-    if algo_cid.endswith(
-        RECOVERY_TP_SUFFIX
-    ):
-        parent_cid = algo_cid[
-            :-len(RECOVERY_TP_SUFFIX)
-        ]
+    # Longest suffix first: recovery "...rtp" also ends with "tp".
+    if cid.endswith(RECOVERY_TP_SUFFIX):
+        return cid[:-len(RECOVERY_TP_SUFFIX)]
 
-    elif algo_cid.endswith(
-        "tp"
+    if cid.endswith("tp"):
+        return cid[:-2]
+
+    return cid
+
+
+def stats_fetch_order_history(start, end):
+
+    start = int(start)
+    end = int(end)
+
+    if end <= start:
+        return []
+
+    result = []
+    seen = set()
+
+    def append_unique(chunk):
+
+        for order in chunk:
+
+            order_id = str(
+                order.get(
+                    "orderId",
+                    ""
+                )
+            )
+
+            cid = str(
+                order.get(
+                    "clientOrderId",
+                    ""
+                )
+            )
+
+            key = (order_id, cid)
+
+            if key in seen:
+                continue
+
+            seen.add(key)
+            result.append(order)
+
+    def fetch_complete_range(
+        range_start,
+        range_end,
+        depth=0
     ):
-        parent_cid = algo_cid[:-2]
+        """
+        WEEX currently ignores `page` on /order/history and can return
+        the same newest 100 records for page=0,1,2,...
+
+        Therefore a full 100-record response is treated as potentially
+        truncated. Split the TIME interval and query both halves until
+        every leaf contains fewer than 100 records.
+
+        Boundaries are non-overlapping:
+            left  = [start, mid]
+            right = [mid + 1, end]
+        """
+
+        range_start = int(range_start)
+        range_end = int(range_end)
+
+        if depth > 64:
+            raise StatsError(
+                "Слишком глубокое разбиение order/history"
+            )
+
+        chunk = private_request(
+            "GET",
+            "/capi/v3/order/history",
+            {
+                "symbol": SYMBOL,
+                "startTime": range_start,
+                "endTime": range_end,
+                "limit": 100,
+                "page": 0
+            },
+            None
+        )
+
+        if not isinstance(chunk, list):
+            raise StatsError(
+                "order/history вернул неожиданный формат"
+            )
+
+        # Less than the API limit means this time slice is complete.
+        if len(chunk) < 100:
+            append_unique(chunk)
+            return
+
+        # Exactly 100 may be truncated because pagination is broken.
+        # If even a single millisecond is saturated, there is no safe
+        # way to prove completeness, so fail loudly instead of silently
+        # losing historical orders.
+        if range_start >= range_end:
+            raise StatsError(
+                "order/history вернул 100 записей в одном миллисекундном "
+                "интервале; невозможно гарантировать полный backfill"
+            )
+
+        midpoint = (
+            range_start
+            + (range_end - range_start) // 2
+        )
+
+        fetch_complete_range(
+            range_start,
+            midpoint,
+            depth + 1
+        )
+
+        fetch_complete_range(
+            midpoint + 1,
+            range_end,
+            depth + 1
+        )
+
+    # WEEX rejects requests spanning more than 7 days.
+    # Keep the already established safe sub-7-day outer windows,
+    # then recursively split dense windows as necessary.
+    window_start = start
+
+    while window_start < end:
+
+        window_end = min(
+            end,
+            window_start + STATS_API_MAX_RANGE_MS
+        )
+
+        fetch_complete_range(
+            window_start,
+            window_end
+        )
+
+        if window_end >= end:
+            break
+
+        window_start = window_end + 1
+
+    return result
+
+
+def ensure_stats_parent_mappings(
+    cache,
+    algos,
+    live_parent_by_client_id
+):
+    """
+    Persist the stable parent mapping used by statistics:
+
+        opening BUY clientOrderId -> opening BUY orderId
+
+    Trading STATE intentionally deletes a completed parent after re-arm.
+    Statistics must not depend on that short-lived STATE entry.
+    """
+
+    mapping = cache.setdefault(
+        "client_order_map",
+        {}
+    )
+
+    # While a parent is still live, STATE is the cheapest source.
+    for cid, parent_id in (
+        live_parent_by_client_id or {}
+    ).items():
+
+        cid = str(cid)
+        parent_id = str(parent_id)
+
+        if cid.startswith(PREFIX) and parent_id:
+            mapping[cid] = parent_id
+
+    # Some WEEX TP payloads expose the original opening parent explicitly.
+    for algo in algos:
+
+        parent_cid = stats_parent_client_id(algo)
+        ws_parent = algo.get(
+            "openTpslParentOrderId"
+        )
+
+        if (
+            parent_cid
+            and ws_parent is not None
+            and str(ws_parent) not in ("", "0")
+        ):
+            mapping[parent_cid] = str(ws_parent)
+
+    missing = {
+        stats_parent_client_id(algo)
+        for algo in algos
+        if stats_parent_client_id(algo)
+        and stats_parent_client_id(algo) not in mapping
+    }
+
+    if not missing:
+        return mapping
+
+    now_ms = int(time.time() * 1000)
+
+    candidate_times = [
+        int(algo.get("createTime", 0) or 0)
+        for algo in algos
+        if stats_parent_client_id(algo) in missing
+        and int(algo.get("createTime", 0) or 0) > 0
+    ]
+
+    # Attached TP createTime is created with the parent BUY. Pull a generous
+    # safety window so an already re-armed/deleted parent can still be mapped.
+    if candidate_times:
+        start_ms = max(
+            0,
+            min(candidate_times) - 7 * 24 * 60 * 60 * 1000
+        )
+    else:
+        start_ms = max(
+            0,
+            now_ms - 7 * 24 * 60 * 60 * 1000
+        )
+
+    orders = stats_fetch_order_history(
+        start_ms,
+        now_ms
+    )
+
+    for order in orders:
+
+        cid = str(
+            order.get(
+                "clientOrderId",
+                ""
+            )
+        )
+
+        order_id = str(
+            order.get(
+                "orderId",
+                ""
+            )
+        )
+
+        if (
+            cid.startswith(PREFIX)
+            and order_id
+        ):
+            mapping[cid] = order_id
+
+    return mapping
+
+
+def algo_parent_id(algo, cache):
+
+    # 1) Explicit opening parent, when WEEX provides it.
+    ws_parent = algo.get(
+        "openTpslParentOrderId"
+    )
+
+    if (
+        ws_parent is not None
+        and str(ws_parent) not in ("", "0")
+    ):
+        return str(ws_parent)
+
+    # 2) Stable persisted clientOrderId -> BUY orderId map.
+    parent_cid = stats_parent_client_id(
+        algo
+    )
 
     if parent_cid:
 
-        for parent_id, info in STATE.get(
-            "parents",
+        mapped = cache.get(
+            "client_order_map",
             {}
-        ).items():
+        ).get(parent_cid)
 
-            if str(
-                info.get(
-                    "client_id",
-                    ""
-                )
-            ) == parent_cid:
+        if mapped:
+            return str(mapped)
 
-                return str(
-                    parent_id
-                )
-
-    # Safe compatibility fallback only when actualOrderId is already one of
-    # our known BUY parent IDs.
-    value = algo.get(
+    # 3) Compatibility fallback: actualOrderId is accepted ONLY when it is
+    # already a known opening BUY id in our statistics cache. It is not trusted
+    # as a general parent link because WEEX may use it for the triggered SELL.
+    actual = algo.get(
         "actualOrderId"
     )
 
-    if value is None:
+    if actual is None:
         return None
 
-    value = str(
-        value
+    actual = str(actual)
+
+    known_parent_ids = set(
+        str(x)
+        for x in cache.get(
+            "client_order_map",
+            {}
+        ).values()
     )
 
-    if value in STATE.get(
-        "parents",
-        {}
-    ):
-        return value
+    known_parent_ids.update(
+        str(x)
+        for x in cache.get(
+            "open_buys",
+            {}
+        ).keys()
+    )
+
+    if actual in known_parent_ids:
+        return actual
 
     return None
 
@@ -1969,7 +2297,8 @@ def recover_buy_for_algo(
 ):
 
     parent_id = algo_parent_id(
-        algo
+        algo,
+        cache
     )
 
     if not parent_id:
@@ -1995,13 +2324,13 @@ def recover_buy_for_algo(
     if create_time <= 0:
         create_time = (
             finish_time
-            - 24 * 60 * 60 * 1000
+            - 7 * 24 * 60 * 60 * 1000
         )
 
     trades = stats_fetch_trades(
         max(
             0,
-            create_time - 60_000
+            create_time - 7 * 24 * 60 * 60 * 1000
         ),
         finish_time + 60_000
     )
@@ -2192,14 +2521,19 @@ def make_stats_snapshot(
         "open_tps"
     ]
 
-    open_parent_ids = {
+    open_parent_ids = set()
 
-        algo_parent_id(algo)
+    for algo in open_tps:
 
-        for algo in open_tps
+        parent_id = algo_parent_id(
+            algo,
+            cache
+        )
 
-        if algo_parent_id(algo)
-    }
+        if parent_id:
+            open_parent_ids.add(
+                parent_id
+            )
 
     unrealized_gross = Decimal("0")
     open_entry_fees = Decimal("0")
@@ -2302,7 +2636,8 @@ def make_stats_snapshot(
 
 def bootstrap_stats_sync(
     current_bid,
-    known_parent_ids
+    known_parent_ids,
+    live_parent_by_client_id
 ):
 
     cache = new_stats_cache()
@@ -2321,14 +2656,30 @@ def bootstrap_stats_sync(
         + open_tps
     )
 
+    ensure_stats_parent_mappings(
+        cache,
+        all_algos,
+        live_parent_by_client_id
+    )
+
     parent_ids = set(
-        known_parent_ids
+        str(x)
+        for x in known_parent_ids
+    )
+
+    parent_ids.update(
+        str(x)
+        for x in cache.get(
+            "client_order_map",
+            {}
+        ).values()
     )
 
     for algo in all_algos:
 
         parent_id = algo_parent_id(
-            algo
+            algo,
+            cache
         )
 
         if parent_id:
@@ -2459,10 +2810,14 @@ def bootstrap_stats_sync(
     ):
 
         parent_id = algo_parent_id(
-            algo
+            algo,
+            cache
         )
 
         if not parent_id:
+            unmatched_algos.append(
+                algo
+            )
             continue
 
         buy = aggregate_buy_fills(
@@ -2546,10 +2901,12 @@ def bootstrap_stats_sync(
     for algo in open_tps:
 
         parent_id = algo_parent_id(
-            algo
+            algo,
+            cache
         )
 
         if not parent_id:
+            missing_open += 1
             continue
 
         buy = aggregate_buy_fills(
@@ -2627,7 +2984,8 @@ def bootstrap_stats_sync(
 def update_stats_sync(
     cache,
     current_bid,
-    known_parent_ids
+    known_parent_ids,
+    live_parent_by_client_id
 ):
 
     market = stats_market_data()
@@ -2656,7 +3014,8 @@ def update_stats_sync(
 
         return bootstrap_stats_sync(
             current_bid,
-            known_parent_ids
+            known_parent_ids,
+            live_parent_by_client_id
         )
 
     start_time = max(
@@ -2686,9 +3045,23 @@ def update_stats_sync(
         )
     )
 
+    ensure_stats_parent_mappings(
+        cache,
+        open_tps + completed_tps,
+        live_parent_by_client_id
+    )
+
     current_parent_ids = set(
         str(x)
         for x in known_parent_ids
+    )
+
+    current_parent_ids.update(
+        str(x)
+        for x in cache.get(
+            "client_order_map",
+            {}
+        ).values()
     )
 
     for algo in (
@@ -2697,7 +3070,8 @@ def update_stats_sync(
     ):
 
         parent_id = algo_parent_id(
-            algo
+            algo,
+            cache
         )
 
         if parent_id:
@@ -2793,10 +3167,14 @@ def update_stats_sync(
     ):
 
         parent_id = algo_parent_id(
-            algo
+            algo,
+            cache
         )
 
         if not parent_id:
+            unmatched_algos.append(
+                algo
+            )
             continue
 
         if parent_id in processed_completed:
@@ -2887,10 +3265,12 @@ def update_stats_sync(
     for algo in open_tps:
 
         parent_id = algo_parent_id(
-            algo
+            algo,
+            cache
         )
 
         if not parent_id:
+            missing_open += 1
             continue
 
         if parent_id in cache[
@@ -3132,6 +3512,14 @@ async def refresh_stats(
                     ].keys()
                 )
 
+                live_parent_by_client_id = {
+                    str(info.get("client_id")):
+                        str(parent_id)
+                    for parent_id, info
+                    in STATE["parents"].items()
+                    if info.get("client_id")
+                }
+
             current_bid = LAST_BID
 
             if current_bid is None:
@@ -3147,7 +3535,8 @@ async def refresh_stats(
                 cache, snapshot = await asyncio.to_thread(
                     bootstrap_stats_sync,
                     current_bid,
-                    known_parent_ids
+                    known_parent_ids,
+                    live_parent_by_client_id
                 )
 
             else:
@@ -3156,7 +3545,8 @@ async def refresh_stats(
                     update_stats_sync,
                     STATS_CACHE,
                     current_bid,
-                    known_parent_ids
+                    known_parent_ids,
+                    live_parent_by_client_id
                 )
 
             STATS_CACHE = cache
@@ -7931,6 +8321,48 @@ async def status_watcher():
 
 
 # =========================================================
+# РУЧНОЙ ЗАПРОС СТАТИСТИКИ ЧЕРЕЗ SIGUSR1
+# Ничего не перезапускает, не ставит PAUSE и не меняет ордера.
+# =========================================================
+
+async def manual_stats_request():
+
+    event_print(
+        "MANUAL_STATS_BEGIN"
+    )
+
+    snapshot = await refresh_stats(
+        show=True,
+        reason="ручной SIGUSR1"
+    )
+
+    if snapshot is None:
+        event_print(
+            "⚠️ Ручная статистика сейчас недоступна; "
+            "торговля не затронута."
+        )
+
+    event_print(
+        "MANUAL_STATS_END"
+    )
+
+
+def install_manual_stats_signal():
+
+    loop = asyncio.get_running_loop()
+
+    def _request_stats():
+        loop.create_task(
+            manual_stats_request()
+        )
+
+    loop.add_signal_handler(
+        signal.SIGUSR1,
+        _request_stats
+    )
+
+
+# =========================================================
 # ПОЛНАЯ СТАТИСТИКА РАЗ В 10 МИНУТ
 # =========================================================
 
@@ -8062,6 +8494,8 @@ async def seed_grid(
 async def main():
 
     global LAST_BID
+
+    install_manual_stats_signal()
 
     # Start public market-data stream before any trading logic. On a good
     # connection this removes the old REST BID poll entirely.
@@ -8350,6 +8784,10 @@ async def main():
 
     event_print(
         "Остановить: Ctrl+C"
+    )
+
+    event_print(
+        "Ручная статистика: SIGUSR1 / команда stats06"
     )
 
     print()

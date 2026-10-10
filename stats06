@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SERVICE="${WEEX_BOT06_SERVICE:-weex-bot06}"
+TIMEOUT_SECONDS="${STATS06_TIMEOUT:-180}"
+
+if ! systemctl is-active --quiet "$SERVICE"; then
+    echo "ERROR: $SERVICE is not active" >&2
+    systemctl status "$SERVICE" --no-pager || true
+    exit 1
+fi
+
+TMP="$(mktemp)"
+JOURNAL_PID=""
+
+cleanup() {
+    if [[ -n "$JOURNAL_PID" ]]; then
+        kill "$JOURNAL_PID" 2>/dev/null || true
+        wait "$JOURNAL_PID" 2>/dev/null || true
+    fi
+    rm -f "$TMP"
+}
+trap cleanup EXIT INT TERM
+
+# Start following BEFORE sending SIGUSR1 so the fresh block cannot be missed.
+journalctl -u "$SERVICE" -f -n 0 --no-pager -o cat >"$TMP" &
+JOURNAL_PID=$!
+sleep 0.2
+
+systemctl kill -s USR1 "$SERVICE"
+
+deadline=$((SECONDS + TIMEOUT_SECONDS))
+while (( SECONDS < deadline )); do
+    if grep -q 'MANUAL_STATS_END' "$TMP"; then
+        break
+    fi
+    sleep 0.1
+done
+
+if ! grep -q 'MANUAL_STATS_END' "$TMP"; then
+    echo "ERROR: fresh statistics did not finish within ${TIMEOUT_SECONDS}s" >&2
+    tail -n 40 "$TMP" >&2 || true
+    exit 1
+fi
+
+awk '
+/MANUAL_STATS_BEGIN/ { printing=1; next }
+/MANUAL_STATS_END/   { if (printing) exit }
+printing             { print }
+' "$TMP"
