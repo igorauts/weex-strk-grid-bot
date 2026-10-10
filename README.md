@@ -1,232 +1,257 @@
 # WEEX STRK Grid Bot
 
-Current version: **bot06 v0.6.7**
+A long-only grid trading bot for **STRKUSDT perpetuals on WEEX**, built around exchange-side take-profit orders, persistent recovery logic, WebSocket monitoring, and read-only performance statistics.
 
-Production-oriented LONG-only grid bot for **STRKUSDT** on WEEX.
+> **Current version:** `bot06 v0.6.8.2`
 
-The strategy logic originated from the earlier CLUSDT bot and was adapted for a much denser STRK grid, then hardened through live operation: WS/REST reconciliation, recovery after missed TP creation, deterministic TP re-arm batching, safe restart, VPS/systemd support, and log rotation.
+## Strategy
 
-> Real-money trading software. Use at your own risk. Verify the account, API permissions, live orders, and state before enabling unattended operation.
-
-## Current strategy
+Current production configuration:
 
 | Parameter | Value |
 |---|---:|
 | Symbol | `STRKUSDT` |
 | Direction | LONG only |
-| Grid step | `0.00010` |
-| Take Profit | `+0.00030` |
-| TP distance | `3` grid steps |
-| BUY size | `20 STRK` |
+| Grid step | `0.00010` USDT |
+| Order size | `20 STRK` |
+| Take profit distance | `+0.00030` USDT |
+| TP distance in grid steps | `3` |
 | Active BUY LIMIT target | `20` |
-| Maximum tracked grid slots | `351` |
-| Maximum potential STRK load | `7,020 STRK` |
-| Maximum new BUY price | `0.08500` |
-| Lower price boundary | none |
-| Entry type | `LIMIT + POST_ONLY` |
-| TP | exchange-side TP |
+| Maximum BUY price | `0.08500` |
+| Lower bound | None |
+| Maximum grid orders | `351` |
+| Maximum potential position | `7020 STRK` |
 
-`0.05000` is **not** a hard lower boundary. It was only used during early grid-density calculations. The grid may continue lower, while the hard `351` slot / `7,020 STRK` cap limits total potential exposure.
+Opening orders are **POST_ONLY LIMIT BUY** orders.
 
-## Grid geometry
+Normal exits are attached exchange-side **TAKE_PROFIT_MARKET** orders. This means protection remains on the exchange even if the Python process or VPS becomes temporarily unavailable.
 
-The working ladder is anchored to the nearest exact `0.00010` level strictly below current BID.
+## Core behavior
 
-```text
-BID 0.07407 -> top BUY 0.07400
-BID 0.07400 -> top BUY 0.07390
-```
+The bot maintains a moving set of 20 active BUY LIMIT orders.
 
-The bot aims to keep **20 correct unfilled BUY LIMIT levels**, not merely “20 orders somewhere”.
+When a BUY fills:
 
-No duplicate live cycle is allowed on the same grid price while an earlier cycle at that price is still OPEN / waiting for TP / being re-armed.
+1. The position is tracked as waiting for TP.
+2. The attached exchange-side TP is monitored.
+3. When the TP completes, the grid level becomes eligible for re-entry.
+4. TP events are collected in a short batch window.
+5. For LONG positions, higher entry levels are re-armed first.
+6. After the batch, the bot performs one grid repair.
+7. Excess lower BUY orders are removed first.
 
-## TP and re-arm
+The strategy intentionally has **no lower grid boundary**.
 
-Normal entry BUYs are submitted with an attached exchange-side TP:
+## TP recovery
 
-```text
-TP = entry + 0.00030
-```
+WEEX has occasionally filled an opening BUY without successfully creating the attached TP.
 
-Example:
+The bot therefore includes recovery protection:
 
-```text
-BUY 0.07400
-TP  0.07430
-```
+- checks active and historical TP state;
+- confirms that the original attached TP is really absent;
+- creates a standalone recovery TP only when required;
+- uses deterministic `clientAlgoId` values;
+- never blindly retries an ambiguous recovery POST;
+- re-queries the deterministic recovery ID before retrying.
 
-### 100 ms TP batch
-
-When multiple TPs complete almost simultaneously, re-arm events are collected for **100 ms**.
-
-For LONG, the batch is restored **from the highest entry price to the lowest** — nearest to current price first.
+Recovery TP properties:
 
 ```text
-completed levels:
-0.07370
-0.07400
-0.07380
-0.07390
-
-re-arm order:
-0.07400
-0.07390
-0.07380
-0.07370
+positionSide = LONG
+triggerPriceType = CONTRACT_PRICE
+executePrice = 0
+reduceOnly = true
+qty = exact opening position size
 ```
 
-After the whole batch is re-armed, the active 20-level grid is repaired **once**. Extra BUY LIMIT orders are trimmed from the lowest price upward.
+## WebSocket and REST safety
 
-## Hard risk limits
+The bot uses:
 
-New BUY orders are never created above:
+- public WebSocket BID updates;
+- private `orders` WebSocket events;
+- private `fill` WebSocket events;
+- REST fallback and safety reconciliation;
+- fill-ID deduplication;
+- partial-fill accumulation;
+- persistent raw private WebSocket logging for diagnostics.
 
-```text
-0.08500
-```
-
-Maximum grid capacity:
-
-```text
-351 grid slots
-x 20 STRK
-= 7,020 STRK
-```
-
-The slot accounting includes live/potential BUY exposure such as open BUY orders, filled BUYs waiting for TP, and ambiguous/pending submits that WEEX may already have accepted.
-
-The bot does **not** inspect, enforce, or modify account leverage.
-
-## Missing attached TP recovery
-
-Live testing exposed an exchange-side edge case: several filled BUY orders were accepted with attached TP parameters, but WEEX did not materialize the corresponding TP orders.
-
-Starting with **v0.6.6**, a confirmed FILLED BUY with no real attached TP is handled as follows:
-
-1. Re-check fresh active TP and TP history.
-2. Avoid blind duplicate creation.
-3. If the attached TP is truly absent, create a standalone exchange-side recovery TAKE PROFIT for the same size and target.
-4. If recovery cannot be safely created or confirmed, PAUSE instead of continuing with an unprotected position.
-
-Recovery TPs use their own deterministic client IDs and are mapped back to the opening BUY.
-
-## Market data and execution monitoring
-
-Primary BID source:
-
-```text
-wss://ws-contract.weex.com/v3/ws/public
-channel: depth15
-```
-
-Private stream:
-
-```text
-wss://ws-contract.weex.com/v3/ws/private
-channels: orders + fill
-```
-
-The bot waits for subscription acknowledgement before considering private WS healthy.
-
-A private-WS watchdog forces reconnect on prolonged silence. REST safety can also request immediate reconnect after detecting an execution missed by WS.
-
-## REST safety and reconciliation
-
-The bot combines:
-
-- event-driven private WS handling;
-- REST safety checks;
-- full reconciliation;
-- pending-submit recovery after ambiguous POST timeouts;
-- server-time synchronization.
-
-A timed-out POST is **not** blindly repeated. WEEX is treated as the source of truth after downtime.
+Trading state transitions are designed to be idempotent so that WebSocket and REST recovery cannot process the same fill twice.
 
 ## Statistics
 
-Closed grid profit is calculated from actual fills:
+`v0.6.8.x` added persistent statistics and historical backfill.
 
-```text
-actual SELL fill
-- actual BUY fill
-- BUY commission
-- SELL commission
-```
+The statistics cache stores enough information to keep completed cycles measurable even after completed parent orders disappear from the live trading state.
 
-Tracked output includes:
+The bot reports:
 
-- closed cycles;
+- closed grid cycles;
+- open BUY LIMIT orders;
+- positions waiting for TP;
 - grid profit;
-- maker/taker volume;
 - paid fees;
+- total volume;
+- maker volume;
+- taker volume;
 - open position;
 - unrealized PnL;
 - total PnL.
 
-TP-to-parent mapping uses deterministic `clientAlgoId -> parent client_id` logic rather than relying on triggered-order `actualOrderId`.
+### Manual statistics refresh
 
-## VPS / production operation
+On the VPS:
 
-**v0.6.7** adds production/VPS infrastructure without changing STRK strategy parameters:
-
-- safe `AUTO_RESUME=1` for an existing live bot;
-- automatic first `START06` is forbidden;
-- runtime paths are relative to the `bot06.py` directory;
-- duplicate process protection uses `fcntl.flock` only;
-- private WS health is separated from REST reconciliation;
-- REST reconcile alone cannot re-enable trading while private WS is unavailable;
-- statistics do not hold the maintenance/reconcile lock;
-- all signed/private REST calls inside the process use one request gate;
-- fatal unhandled errors return exit code `1`;
-- optional Telegram alerts for critical conditions;
-- pinned Python dependencies;
-- ready-to-use systemd unit and logrotate config.
-
-The production deployment has been validated with systemd restart + automatic RESUME.
-
-## Log rotation
-
-Current intended production policy:
-
-```text
-daily
-rotate 14
-maxsize 1G
-compress
-delaycompress
+```bash
+stats06
 ```
 
-Runtime logs themselves should **not** be committed to Git.
+`stats06` sends `SIGUSR1` to the running bot and waits for a fresh statistics block without restarting or pausing the strategy.
 
-## Files
+Default timeout:
 
 ```text
-bot06.py                  Current v0.6.7 bot
-README.md                 Project overview
-PROJECT_LOG.md            Development / production snapshot
-VPS_SETUP.md              VPS deployment guide
-requirements.txt          Pinned Python dependencies
-.env.example              Safe environment template
-.gitignore                Excludes secrets/runtime state
-weex-bot06.service        systemd service
-weex-bot06.logrotate      logrotate configuration
+180 seconds
 ```
 
-## Secrets and runtime state
+You can override it temporarily:
 
-Never commit:
+```bash
+STATS06_TIMEOUT=300 stats06
+```
+
+## Historical backfill fix in v0.6.8.2
+
+WEEX `/capi/v3/order/history` was observed to return the same newest 100 records even when the `page` parameter changed.
+
+As a result, normal pagination could silently miss older opening BUY orders.
+
+`v0.6.8.2` no longer relies on pagination for statistics backfill.
+
+Instead:
+
+1. historical requests are kept below the WEEX 7-day API limit;
+2. any time window returning 100 records is treated as potentially truncated;
+3. that time range is recursively split into smaller non-overlapping intervals;
+4. results are deduplicated by order identity;
+5. backfill fails loudly rather than silently accepting incomplete history.
+
+This restored historical parent mappings and removed false unmatched-cycle warnings.
+
+## Observed TP execution
+
+During production testing, exchange-side `TAKE_PROFIT_MARKET` execution was audited against actual WEEX fills.
+
+A read-only audit verified:
+
+- every sampled completed TP had a unique SELL trade ID;
+- every sampled completed TP had a unique SELL order ID;
+- no reused trade IDs;
+- no partial SELL fills in the audited sample;
+- WEEX algo `actualPrice` matched `/userTrades` SELL price.
+
+In the audited production sample, the average realized TP distance was slightly **better than the nominal 3 grid steps** because fast upward moves occasionally produced positive market slippage.
+
+These observations are historical measurements, not a guarantee of future execution quality.
+
+## VPS / systemd
+
+Example service commands:
+
+```bash
+systemctl status weex-bot06 --no-pager
+journalctl -u weex-bot06 -f
+journalctl -u weex-bot06 -n 80 --no-pager
+systemctl restart weex-bot06
+systemctl stop weex-bot06
+systemctl start weex-bot06
+```
+
+To stop the service and disable automatic startup:
+
+```bash
+systemctl disable --now weex-bot06
+```
+
+Important: stopping the Python process does **not** automatically cancel exchange-side orders. Always check WEEX after stopping the service.
+
+## Installation
+
+Create a virtual environment and install dependencies:
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+```
+
+Create your environment file from the example:
+
+```bash
+cp .env.example .env
+chmod 600 .env
+```
+
+Fill in your own WEEX API credentials.
+
+Recommended API permissions:
+
+- trading: ON;
+- read access: ON;
+- withdrawals: OFF;
+- IP whitelist: recommended for a fixed VPS.
+
+Never commit `.env` or API credentials.
+
+## Files that must stay private
+
+Do **not** commit:
 
 ```text
 .env
 state06.json
 stats_state06.json
 logs/
-*.lock
 ```
 
-The repository contains `.env.example` only.
+The repository `.gitignore` should exclude runtime state, statistics state, logs, and credentials.
 
-## Multi-bot scaling
+## Version history
 
-For **10–20 bots on the same WEEX account**, the next architectural step should be an account-level shared layer for private WS, signed REST, reconciliation and rate limiting instead of multiplying identical account polling across many independent processes.
+### v0.6.8.2
+
+- fixed incomplete WEEX `order/history` backfill caused by broken/ignored pagination;
+- added recursive time-window splitting for dense historical ranges;
+- preserves the WEEX maximum historical request window;
+- restored complete parent BUY mappings for statistics;
+- eliminated false unmatched-cycle warnings;
+- production `stats06` timeout increased to 180 seconds.
+
+### v0.6.8.1
+
+- split statistics history requests into safe sub-7-day windows;
+- fixed WEEX `-1170: Time range cannot exceed 7 days`.
+
+### v0.6.8
+
+- persistent `clientOrderId -> orderId` statistics mapping;
+- historical cycle recovery after parent deletion from live state;
+- statistics migration/backfill;
+- manual `SIGUSR1` statistics refresh;
+- `stats06` helper.
+
+### v0.6.7
+
+- previous production baseline.
+
+## Risk warning
+
+This project is experimental trading software.
+
+It can place and cancel real orders and can create leveraged market exposure. Exchange APIs, WebSocket behavior, order semantics, liquidity, fees, slippage, outages, and rate limits can change without notice.
+
+Review the code, test with small size, monitor exchange-side positions and orders, and use it at your own risk.
+
+## License
+
+No license is currently granted unless a license file is added to the repository.
