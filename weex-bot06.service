@@ -1,0 +1,28 @@
+[Unit]
+Description=WEEX STRK Grid Bot06
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=weexbot
+Group=weexbot
+WorkingDirectory=/opt/weex-bot
+EnvironmentFile=/opt/weex-bot/.env
+ExecStart=/opt/weex-bot/.venv/bin/python /opt/weex-bot/bot06.py
+
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=20
+
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/weex-bot
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target

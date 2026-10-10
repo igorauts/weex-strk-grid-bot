@@ -1,0 +1,11 @@
+/opt/weex-bot/logs/bot06.log /opt/weex-bot/logs/private_ws_raw06.log {
+    daily
+    rotate 14
+    size 100M
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    su weexbot weexbot
+}

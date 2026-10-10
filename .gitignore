@@ -1,0 +1,11 @@
+.env
+state06.json
+state06.tmp
+stats_state06.json
+stats_state06.tmp
+logs/
+*.lock
+__pycache__/
+*.py[cod]
+.venv/
+.DS_Store
